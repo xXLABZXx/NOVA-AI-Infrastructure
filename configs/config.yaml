@@ -1,0 +1,93 @@
+# NOVA AI Infrastructure - central configuration.
+# Every module can be enabled/disabled independently via `modules.<name>`.
+# Values here can be overridden with environment variables:
+#   NOVA_<SECTION>_<KEY>  (e.g. NOVA_SANDBOX_MAX_DOWNLOAD_BYTES=10485760)
+# Nested keys use underscores; lists are comma-separated.
+
+modules:
+  sandbox: true
+  crawlers: true
+  ingestion: true
+  deduplication: true
+  curation: true
+  teacher: false        # requires DEEPSEEK_API_KEY (or another teacher key) to do real work
+  training: true
+  evaluation: true
+  monitoring: true
+  security: true
+
+paths:
+  data_root: "data"
+  logs_dir: "logs"
+  quarantine_dir: "quarantine"
+
+sandbox:
+  enabled: true                 # network access is DISABLED by default; enabled here explicitly
+  allowlist:                    # empty = deny everything except blocklist-exempted? No: empty allowlist + enabled => allow all non-blocked. Prefer explicit allowlist.
+    - "en.wikipedia.org"
+    - "arxiv.org"
+    - "docs.python.org"
+  blocklist: []
+  max_download_bytes: 5242880  # 5 MiB per download
+  timeout_seconds: 15
+  max_retries: 3
+  retry_backoff_seconds: 2.0
+  requests_per_minute: 30
+  allowed_content_types:
+    - "text/html"
+    - "text/plain"
+    - "application/pdf"
+    - "application/rss+xml"
+    - "application/atom+xml"
+  user_agent: "NOVA-ResearchBot/0.1 (+https://example.com/bot; research crawler)"
+
+crawlers:
+  enabled: true
+  max_depth: 2
+  max_pages_per_domain: 200
+  concurrency: 4
+  politeness_delay_seconds: 1.0
+  respect_robots_txt: true
+  follow_sitemaps: true
+
+ingestion:
+  enabled: true
+  min_text_chars: 200
+  allowed_languages: ["en"]
+
+curation:
+  enabled: true
+  min_quality_score: 0.35
+  min_source_reliability: 0.2
+  require_human_approval: true
+
+teacher:
+  enabled: false
+  provider: "deepseek"          # "deepseek" | "openai-compatible"
+  base_url: "https://api.deepseek.com"
+  model: "deepseek-chat"
+  max_calls_per_run: 50
+  max_tokens_per_call: 2000
+  temperature: 0.2
+
+training:
+  enabled: true
+  batch_size: 8
+  gradient_accumulation_steps: 4
+  sequence_length: 2048
+  learning_rate: 0.00002
+  mixed_precision: true
+  checkpoint_dir: "checkpoints"
+  eval_before_dataset_update: true
+
+evaluation:
+  enabled: true
+
+monitoring:
+  enabled: true
+  log_level: "INFO"
+  disk_quota_gb: 50
+
+security:
+  enabled: true
+  max_input_chars: 1000000
