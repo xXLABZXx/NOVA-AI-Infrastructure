@@ -15,6 +15,7 @@ import json
 import os
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 
 
 class TeacherDisabled(Exception):
@@ -42,11 +43,21 @@ class TeacherClient:
         max_tokens_per_call: int = 2000,
         temperature: float = 0.2,
         timeout_seconds: int = 60,
+        auth_hook: Callable[[urllib.request.Request], None] | None = None,
     ) -> None:
+        """Create a teacher client.
+
+        ``auth_hook`` is an optional callable applied to every outbound
+        ``urllib`` request before it is sent. It exists for runtimes (like
+        Hatch's Secure Vault) where the credential must be attached as a
+        short-lived surrogate instead of a static ``Authorization`` header.
+        When ``auth_hook`` is given, no raw API key is needed or stored.
+        """
         self.provider = provider
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key
+        self.auth_hook = auth_hook
         self.max_calls_per_run = max_calls_per_run
         self.max_tokens_per_call = max_tokens_per_call
         self.temperature = temperature
@@ -87,8 +98,8 @@ class TeacherClient:
     # -- state ------------------------------------------------------------
     @property
     def enabled(self) -> bool:
-        """True only when an API key is configured."""
-        return bool(self.api_key)
+        """True when a credential is available (raw key or auth hook)."""
+        return bool(self.api_key) or self.auth_hook is not None
 
     # -- HTTP plumbing ------------------------------------------------------
     def _post_json(
@@ -106,6 +117,8 @@ class TeacherClient:
             headers={**headers, "Content-Type": "application/json"},
             method="POST",
         )
+        if self.auth_hook is not None:
+            self.auth_hook(request)
         try:
             with urllib.request.urlopen(request,
                                         timeout=self.timeout_seconds) as resp:
@@ -154,7 +167,11 @@ class TeacherClient:
             "max_tokens": tokens,
             "temperature": self.temperature,
         }
-        headers = {"Authorization": f"Bearer {self.api_key}"}
+        headers = {}
+        if self.api_key:
+            headers = {"Authorization": f"Bearer {self.api_key}"}
+        # With an auth_hook the credential is attached per-request (e.g. a
+        # short-lived surrogate); no static Authorization header is needed.
 
         self.calls_made += 1  # attempts count against the budget
         try:

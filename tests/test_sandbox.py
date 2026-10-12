@@ -7,6 +7,7 @@ is blocked before any socket opens. No real external network is used.
 import hashlib
 import json
 import socket
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -301,3 +302,146 @@ def test_from_config_real_config_file():
     assert "arxiv.org" in client.allowlist
     assert client.max_download_bytes == 5242880
     assert "text/html" in (client.allowed_content_types or [])
+
+
+# ------------------------------------------- extra headers + 304 handling
+
+
+class _FakeResponse:
+    """Minimal urllib response stand-in for opener stubbing."""
+
+    def __init__(self, status, headers, body):
+        self.status = status
+        self.headers = dict(headers)
+        self._body = body
+
+    def read(self, n=-1):
+        if not self._body:
+            return b""
+        chunk, self._body = self._body[:n], self._body[n:]
+        return chunk
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+class _CapturingOpener:
+    """Stand-in for the urllib opener: records requests, replays behavior."""
+
+    def __init__(self, behavior):
+        self.behavior = behavior
+        self.requests = []
+
+    def open(self, req, timeout=None):
+        self.requests.append(req)
+        return self.behavior(req)
+
+
+def test_extra_headers_reach_the_request(tmp_path):
+    seen = {}
+
+    def behavior(req):
+        seen["headers"] = {k.lower(): v for k, v in req.header_items()}
+        return _FakeResponse(
+            200, {"Content-Type": "text/html"}, b"<html>ok</html>"
+        )
+
+    client = make_client()
+    client._opener = _CapturingOpener(behavior)
+    result = client.fetch(
+        "http://127.0.0.1/page",
+        headers={"If-None-Match": '"abc123"',
+                 "If-Modified-Since": "Mon, 12 Oct 2026 00:00:00 GMT"},
+    )
+    assert result.status_code == 200
+    assert seen["headers"]["if-none-match"] == '"abc123"'
+    assert seen["headers"]["if-modified-since"] == \
+        "Mon, 12 Oct 2026 00:00:00 GMT"
+    # The configured default User-Agent is still sent alongside.
+    assert seen["headers"]["user-agent"] == client.user_agent
+
+
+def test_header_user_agent_override(tmp_path):
+    seen = {}
+
+    def behavior(req):
+        seen["headers"] = {k.lower(): v for k, v in req.header_items()}
+        return _FakeResponse(
+            200, {"Content-Type": "text/html"}, b"<html>ok</html>"
+        )
+
+    client = make_client(user_agent="DefaultBot/1.0")
+    client._opener = _CapturingOpener(behavior)
+    client.fetch("http://127.0.0.1/page",
+                 headers={"User-Agent": "NOVA-Bot/0.2"})
+    # Only one User-Agent header may go out (no duplicates).
+    uas = [v for k, v in seen["headers"].items() if k == "user-agent"]
+    assert uas == ["NOVA-Bot/0.2"]
+
+
+def test_304_returns_result_without_retry(tmp_path):
+    calls = []
+
+    def behavior(req):
+        calls.append(req)
+        raise urllib.error.HTTPError(
+            req.full_url, 304, "Not Modified", {"ETag": '"abc123"'}, None
+        )
+
+    audit = tmp_path / "audit.jsonl"
+    qdir = tmp_path / "quarantine"
+    client = make_client(quarantine_dir=qdir, audit_log_path=audit)
+    client._opener = _CapturingOpener(behavior)
+
+    result = client.fetch("http://127.0.0.1/page",
+                          headers={"If-None-Match": '"abc123"'})
+
+    assert result.status_code == 304
+    assert result.body == b""
+    assert result.quarantine_path is None  # nothing new to quarantine
+    assert len(calls) == 1  # 304 is final: never retried
+
+    records = [json.loads(line)
+               for line in audit.read_text().splitlines()]
+    assert len(records) == 1
+    assert records[0]["status_code"] == 304
+    assert "error" not in records[0]
+
+
+def test_304_from_real_server(local_http_server):
+    local_http_server.routes["/cond"] = (
+        304, {"ETag": '"abc123"'}, b""
+    )
+    client = make_client()
+    result = client.fetch(f"{local_http_server.base_url}/cond",
+                          headers={"If-None-Match": '"abc123"'})
+    assert result.status_code == 304
+    assert result.body == b""
+
+
+def test_disallowed_header_rejected():
+    client = make_client()
+    with pytest.raises(SandboxError):
+        client.fetch("http://127.0.0.1/page", headers={"Host": "evil.com"})
+    with pytest.raises(SandboxError):
+        client.fetch("http://127.0.0.1/page",
+                     headers={"Cookie": "session=abc"})
+    with pytest.raises(SandboxError):
+        client.fetch("http://127.0.0.1/page",
+                     headers={"Authorization": "Bearer x"})
+
+
+def test_header_injection_rejected():
+    client = make_client()
+    with pytest.raises(SandboxError):
+        client.fetch("http://127.0.0.1/page",
+                     headers={"If-None-Match": '"a"\r\nEvil: 1'})
+    with pytest.raises(SandboxError):
+        client.fetch("http://127.0.0.1/page",
+                     headers={"If-None-Match\r\nEvil": "x"})
+    with pytest.raises(SandboxError):
+        client.fetch("http://127.0.0.1/page",
+                     headers={"If-None-Match": 123})  # not a string

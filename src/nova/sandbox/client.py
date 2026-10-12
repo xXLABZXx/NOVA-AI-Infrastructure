@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import http.client
 import json
+import re
 import socket
 import ssl
 import time
@@ -43,6 +44,64 @@ from .ssrf import check_host
 
 _CHUNK_SIZE = 65536
 _MAX_SINGLE_BACKOFF = 30.0  # seconds; cap for exponential retry backoff
+
+# Caller-supplied request headers are restricted to this allowlist. Anything
+# else -- Host, Connection, Cookie, Authorization, Proxy-*, Content-Length,
+# Range, ... -- is rejected: such headers could bypass domain policy, SSRF
+# validation, or size caps. The informational headers below are enough for
+# crawlers (conditional revalidation, content negotiation, identity).
+_ALLOWED_EXTRA_HEADERS = frozenset({
+    "user-agent",
+    "accept",
+    "accept-language",
+    "if-none-match",
+    "if-modified-since",
+})
+
+# Canonical display casing for the allowed headers.
+_CANONICAL_HEADER_NAMES = {
+    "user-agent": "User-Agent",
+    "accept": "Accept",
+    "accept-language": "Accept-Language",
+    "if-none-match": "If-None-Match",
+    "if-modified-since": "If-Modified-Since",
+}
+
+_TOKEN_RE = re.compile(r"[!#$%&'*+\-.^_`|~0-9a-zA-Z]+")
+
+
+def _sanitize_extra_headers(headers: dict | None) -> dict[str, str]:
+    """Validate caller-supplied headers; raise :class:`SandboxError` on misuse.
+
+    Returns a dict keyed by lower-cased header name. Unknown names, header
+    injection attempts (CR/LF in names or values), and non-string values are
+    all hard errors -- silently dropping a security-relevant header would be
+    worse than failing loudly.
+    """
+    if not headers:
+        return {}
+    if not isinstance(headers, dict):
+        raise SandboxError("headers must be a mapping of header name -> value")
+    cleaned: dict[str, str] = {}
+    for name, value in headers.items():
+        if not isinstance(name, str) or not isinstance(value, str):
+            raise SandboxError("header names and values must be strings")
+        canonical = name.strip().lower()
+        if (
+            not canonical
+            or "\r" in name
+            or "\n" in name
+            or _TOKEN_RE.fullmatch(canonical) is None
+        ):
+            raise SandboxError(f"invalid header name {name!r}")
+        if canonical not in _ALLOWED_EXTRA_HEADERS:
+            raise SandboxError(
+                f"header {name!r} is not allowed on sandboxed fetches"
+            )
+        if "\r" in value or "\n" in value:
+            raise SandboxError(f"invalid value for header {name!r}")
+        cleaned[canonical] = value
+    return cleaned
 
 
 @dataclass
@@ -193,13 +252,21 @@ class SandboxHttpClient:
 
     # ------------------------------------------------------------------- fetch
 
-    def fetch(self, url: str) -> FetchResult:
+    def fetch(self, url: str, headers: dict | None = None) -> FetchResult:
         """Fetch ``url`` through every sandbox control.
+
+        ``headers`` carries optional extra request headers. Only the safe
+        informational headers are accepted (``User-Agent``, ``Accept``,
+        ``Accept-Language``, ``If-None-Match``, ``If-Modified-Since``); any
+        other name raises :class:`SandboxError`. A ``304 Not Modified``
+        response is returned as a :class:`FetchResult` with
+        ``status_code == 304`` and an empty body rather than raising.
 
         Raises a :class:`SandboxError` subclass on any policy violation or
         operational failure. Every attempt (success or failure) is audit
         logged when ``audit_log_path`` is set.
         """
+        extra_headers = _sanitize_extra_headers(headers)
         started = time.monotonic()
         status_code = 0
         nbytes = 0
@@ -207,7 +274,7 @@ class SandboxHttpClient:
         content_type = ""
         error: str | None = None
         try:
-            result = self._fetch(url, started)
+            result = self._fetch(url, started, extra_headers)
         except Exception as exc:  # noqa: BLE001 - audit must see every failure
             error = f"{type(exc).__name__}: {exc}"
             raise
@@ -222,7 +289,7 @@ class SandboxHttpClient:
             self._audit(url, status_code, nbytes, sha, content_type, elapsed, error)
             self._emit_event(url, status_code, nbytes, sha, content_type, elapsed, error)
 
-    def _fetch(self, url: str, started: float) -> FetchResult:
+    def _fetch(self, url: str, started: float, extra_headers: dict) -> FetchResult:
         # (1) enabled?
         if not self.enabled:
             raise SandboxDisabledError(
@@ -246,7 +313,7 @@ class SandboxHttpClient:
         if not self._bucket.acquire(timeout=self.timeout_seconds):
             raise FetchFailedError("rate limit wait timed out")
         # (6)-(10) download, validate, hash, quarantine.
-        return self._download(url, host, started)
+        return self._download(url, host, started, extra_headers)
 
     # --------------------------------------------------------------- policies
 
@@ -273,8 +340,16 @@ class SandboxHttpClient:
 
     # --------------------------------------------------------------- download
 
-    def _download(self, url: str, host: str, started: float) -> FetchResult:
-        req = urllib.request.Request(url, headers={"User-Agent": self.user_agent})
+    def _download(
+        self, url: str, host: str, started: float, extra_headers: dict
+    ) -> FetchResult:
+        merged = {"user-agent": self.user_agent}
+        merged.update(extra_headers)
+        request_headers = {
+            _CANONICAL_HEADER_NAMES[name]: value
+            for name, value in merged.items()
+        }
+        req = urllib.request.Request(url, headers=request_headers)
         attempts = self.max_retries + 1
         last_exc: BaseException | None = None
         for attempt in range(attempts):
@@ -282,6 +357,26 @@ class SandboxHttpClient:
                 with self._opener.open(req, timeout=self.timeout_seconds) as resp:
                     return self._read_response(resp, url, started)
             except urllib.error.HTTPError as exc:
+                if exc.code == 304:
+                    # Not an error: the server says content is unchanged.
+                    # Return immediately -- never retry a 304.
+                    headers = dict(exc.headers) if exc.headers else {}
+                    content_type = (
+                        (headers.get("Content-Type") or "")
+                        .split(";")[0]
+                        .strip()
+                        .lower()
+                    )
+                    return FetchResult(
+                        url=url,
+                        status_code=304,
+                        headers=headers,
+                        body=b"",
+                        sha256=hashlib.sha256(b"").hexdigest(),
+                        content_type=content_type,
+                        quarantine_path=None,  # nothing new to quarantine
+                        elapsed_seconds=time.monotonic() - started,
+                    )
                 # Never retry 4xx: the server understood and refused.
                 if 400 <= exc.code < 500:
                     raise FetchFailedError(
