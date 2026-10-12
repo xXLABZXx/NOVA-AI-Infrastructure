@@ -44,11 +44,23 @@ sandbox:
 crawlers:
   enabled: true
   max_depth: 2
-  max_pages_per_domain: 200
-  concurrency: 4
-  politeness_delay_seconds: 1.0
+  max_pages_per_domain: 200   # legacy alias for max_pages_per_host (kept working)
+  max_pages_per_host: 200     # per-host page budget
+  max_pages_total: 5000       # global page budget per crawl (0 = unlimited)
+  concurrency: 10             # bounded worker threads for fetching
+  politeness_delay_seconds: 1.0   # legacy default per-host delay (kept working)
+  per_host_delay_seconds: 1.0     # default minimum delay between requests to one host
+  crawl_delay_default_seconds: 1.0  # fallback when robots.txt declares no crawl-delay
+  robots_ttl_hours: 24        # how long a cached robots.txt stays valid
   respect_robots_txt: true
-  follow_sitemaps: true
+  follow_sitemaps: true       # enqueue Sitemap: URLs from robots.txt
+  follow_feeds: true          # enqueue RSS/Atom feeds discovered in pages
+  retry_limit: 2              # retries after the first attempt
+  retry_backoff_base_seconds: 0.5   # exponential backoff with jitter between retries
+  retry_backoff_max_seconds: 60.0
+  requests_per_minute: 120    # global scheduler token bucket (0 = disabled)
+  frontier_db: ".frontier.db" # persistent work queue inside the --out directory
+  user_agent: "NOVA-ResearchBot/0.1 (+https://example.com/bot; research crawler)"
 
 ingestion:
   enabled: true
