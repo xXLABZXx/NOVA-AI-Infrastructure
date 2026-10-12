@@ -18,17 +18,10 @@ from pathlib import Path
 
 
 def _build_fetcher(sandbox_section: dict):
-    """Instantiate the sandbox HTTP client defensively (built in parallel)."""
+    """Instantiate the sandbox HTTP client from config (all knobs honored)."""
     from nova.sandbox import SandboxHttpClient
 
-    for kwargs in ({"config": sandbox_section}, {"section": sandbox_section},
-                   {}):
-        try:
-            return SandboxHttpClient(**kwargs)
-        except TypeError:
-            continue
-    # Last resort: try a bare positional call.
-    return SandboxHttpClient(sandbox_section)
+    return SandboxHttpClient.from_config(dict(sandbox_section or {}))
 
 
 def write_dead_letter(dead_entries: list[dict], out_path: str | Path) -> Path:
