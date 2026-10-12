@@ -1,0 +1,28 @@
+services:
+  sandbox:
+    build: .
+    image: nova-sandbox:0.1.0
+    container_name: nova-sandbox
+    # Hardened runtime: no host network, read-only root, dropped capabilities.
+    network_mode: bridge
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 1g
+    pids_limit: 128
+    volumes:
+      # Quarantine is the ONLY writable shared path for downloads.
+      - ./quarantine:/quarantine
+      - ./logs:/logs:rw
+      - ./configs:/app/configs:ro
+    env_file:
+      - .env
+    environment:
+      NOVA_PATHS_QUARANTINE_DIR: /quarantine
+      NOVA_PATHS_LOGS_DIR: /logs
+    # NOTE: the training pipeline and data dirs are NOT mounted here.
+    # Downloads must be explicitly promoted after scanning.
