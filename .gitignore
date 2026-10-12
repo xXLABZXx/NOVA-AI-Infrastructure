@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+
+# Environment & secrets - NEVER commit real credentials
+.env
+*.pem
+*.key
+
+# Runtime outputs
+logs/*
+!logs/.gitkeep
+
+# Quarantined sandbox downloads (untrusted content)
+quarantine/*
+
+# Data: manifests and directory scaffolding only; real datasets stay out of git
+data/raw/*
+data/cleaned/*
+data/approved/*
+data/rejected/*
+!data/raw/.gitkeep
+!data/cleaned/.gitkeep
+!data/approved/.gitkeep
+!data/rejected/.gitkeep
+!data/*/README.md
+!data/README.md
+
+# Model artifacts - never commit checkpoints
+*.pt
+*.pth
+*.bin
+*.safetensors
+checkpoints/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
