@@ -35,10 +35,11 @@ class DocsCrawler(BaseCrawler):
         self.docs_allowlist = [h.lower() for h in (docs_allowlist or [])]
 
     @classmethod
-    def from_config(cls, section: dict, *, fetcher, seen_store=None) -> "DocsCrawler":
+    def from_config(cls, section: dict, *, fetcher, seen_store=None,
+                    frontier=None) -> "DocsCrawler":
         """Build from a config section; reads ``docs_allowlist`` when present."""
         crawler = super().from_config(section, fetcher=fetcher,
-                                      seen_store=seen_store)
+                                      seen_store=seen_store, frontier=frontier)
         crawler.docs_allowlist = [
             h.lower() for h in section.get("docs_allowlist", []) or []
         ]
