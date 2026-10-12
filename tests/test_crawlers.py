@@ -380,3 +380,316 @@ def test_seen_store_sqlite_contents(tmp_path):
         assert len(rows) == 1 and len(rows[0][0]) == 64
     finally:
         store2.close()
+
+
+# ---------------------------------------------------------------------------
+# NEW: upgraded crawler subsystem
+# ---------------------------------------------------------------------------
+import json as _json
+import time as _time
+
+from nova.crawlers.canonical import canonicalize_url
+from nova.crawlers.extract import extract_article
+from nova.crawlers.frontier import Frontier
+
+
+class TimingFetcher(FakeFetcher):
+    """FakeFetcher that records monotonic timestamps of each fetch."""
+
+    def __init__(self, routes):
+        super().__init__(routes)
+        self.times: list[tuple[str, float]] = []
+
+    def fetch(self, url: str):
+        self.times.append((url, _time.monotonic()))
+        return super().fetch(url)
+
+
+class ConditionalFetcher(FakeFetcher):
+    """FakeFetcher honouring conditional headers (returns 304 on match)."""
+
+    def __init__(self, routes):
+        super().__init__(routes)
+        self.conditional_used: list[tuple[str, dict]] = []
+
+    def fetch(self, url: str, headers: dict | None = None):
+        self.fetched.append(url)
+        if headers:
+            self.conditional_used.append((url, dict(headers)))
+            if headers.get("If-None-Match") == '"abc123"':
+                return FakeResult(304, {}, b"")
+        status, hdrs, body = self.routes[url]
+        return FakeResult(status, hdrs, body)
+
+
+# -- URL canonicalization ----------------------------------------------------
+def test_canonicalize_strips_tracking_params():
+    a = canonicalize_url(
+        "HTTP://Example.COM:80/About/?utm_source=google&x=1&fbclid=abc#frag")
+    b = canonicalize_url("http://example.com/About/?x=1")
+    assert a == b == "http://example.com/About?x=1"
+    # Query params are sorted for a stable order.
+    assert canonicalize_url("https://example.com/p/?b=2&a=1") == \
+        "https://example.com/p?a=1&b=2"
+    # Trailing slash collapsed (root keeps its slash).
+    assert canonicalize_url("http://example.com/a/") == "http://example.com/a"
+    assert canonicalize_url("http://example.com") == "http://example.com/"
+    # Non-default ports are kept; garbage returns "".
+    assert canonicalize_url("http://example.com:8080/x") == \
+        "http://example.com:8080/x"
+    assert canonicalize_url("not a url") == ""
+    assert canonicalize_url("") == ""
+
+
+def test_canonical_dedup_before_fetch():
+    # Same page under tracking-param disguises is fetched exactly once.
+    routes = {
+        "http://example.com/page": (200, {}, _html("P", ENGLISH_BODY)),
+    }
+    fetcher = FakeFetcher(routes)
+    crawler = GeneralCrawler(
+        fetcher=fetcher, politeness_delay_seconds=0,
+        respect_robots_txt=False, concurrency=2, max_depth=0)
+    crawler.crawl([
+        "http://example.com/page",
+        "http://example.com/page?utm_campaign=x#top",
+        "http://example.com/page?fbclid=zzz",
+    ])
+    assert fetcher.fetched == ["http://example.com/page"]
+
+
+# -- per-host politeness -------------------------------------------------------
+def test_per_host_politeness_enforced():
+    routes = {
+        "http://example.com/a": (200, {}, _html("A", ENGLISH_BODY)),
+        "http://example.com/b": (200, {}, _html("B", ENGLISH_BODY)),
+    }
+    fetcher = TimingFetcher(routes)
+    crawler = GeneralCrawler(
+        fetcher=fetcher, politeness_delay_seconds=0,
+        per_host_delay_seconds=0.3, respect_robots_txt=False,
+        concurrency=2, max_depth=0, follow_feeds=False)
+    crawler.crawl(["http://example.com/a", "http://example.com/b"])
+    times = sorted(t for u, t in fetcher.times
+                   if u in ("http://example.com/a", "http://example.com/b"))
+    assert len(times) == 2
+    assert times[1] - times[0] >= 0.25
+
+
+def test_robots_crawl_delay_honored():
+    robots_txt = b"User-agent: *\nCrawl-delay: 1\n"
+    routes = {
+        "http://example.com/robots.txt": (200, {}, robots_txt),
+        "http://example.com/a": (200, {}, _html("A", ENGLISH_BODY)),
+        "http://example.com/b": (200, {}, _html("B", ENGLISH_BODY)),
+    }
+    fetcher = TimingFetcher(routes)
+    crawler = GeneralCrawler(
+        fetcher=fetcher, politeness_delay_seconds=0.05,
+        respect_robots_txt=True, concurrency=2, max_depth=0,
+        follow_sitemaps=False, follow_feeds=False)
+    crawler.crawl(["http://example.com/a", "http://example.com/b"])
+    times = sorted(t for u, t in fetcher.times
+                   if u in ("http://example.com/a", "http://example.com/b"))
+    assert len(times) == 2
+    assert times[1] - times[0] >= 0.9
+
+
+# -- frontier persistence / resume ----------------------------------------------
+def test_frontier_persistence_resume(tmp_path):
+    routes = {
+        "http://example.com/1": (200, {}, _html("P1", ENGLISH_BODY)),
+        "http://example.com/2": (200, {}, _html("P2", ENGLISH_BODY)),
+    }
+    db = str(tmp_path / "frontier.db")
+
+    fetcher1 = FakeFetcher(routes)
+    frontier1 = Frontier(db)
+    crawler1 = GeneralCrawler(
+        fetcher=fetcher1, frontier=frontier1, politeness_delay_seconds=0,
+        respect_robots_txt=False, concurrency=2, max_pages_total=1,
+        follow_feeds=False)
+    first = crawler1.crawl(
+        ["http://example.com/1", "http://example.com/2"])
+    assert [r.url for r in first] == ["http://example.com/1"]
+    frontier1.close()
+
+    # Fresh crawler, same DB: the completed URL must not be refetched.
+    fetcher2 = FakeFetcher(routes)
+    frontier2 = Frontier(db)
+    crawler2 = GeneralCrawler(
+        fetcher=fetcher2, frontier=frontier2, politeness_delay_seconds=0,
+        respect_robots_txt=False, concurrency=2, follow_feeds=False)
+    second = crawler2.crawl(
+        ["http://example.com/1", "http://example.com/2"])
+    assert [r.url for r in second] == ["http://example.com/2"]
+    assert fetcher2.fetched == ["http://example.com/2"]
+    frontier2.close()
+
+
+# -- retries, backoff, dead letter -----------------------------------------------
+def test_retry_then_dead_letter(tmp_path):
+    routes = {"http://example.com/bad": (500, {}, b"boom")}
+    fetcher = FakeFetcher(routes)
+    frontier = Frontier(str(tmp_path / "frontier.db"))
+    crawler = GeneralCrawler(
+        fetcher=fetcher, frontier=frontier, politeness_delay_seconds=0,
+        respect_robots_txt=False, retry_limit=2,
+        retry_backoff_base_seconds=0.01, retry_backoff_max_seconds=0.05,
+        concurrency=2, max_depth=0, follow_feeds=False)
+    try:
+        results = crawler.crawl(["http://example.com/bad"])
+        assert fetcher.fetched.count("http://example.com/bad") == 3
+        assert len(results) == 1
+        assert results[0].error and "500" in results[0].error
+        assert len(crawler.failed) == 1
+        assert crawler.failed[0]["attempts"] == 3
+
+        dead = frontier.dead_entries()
+        assert len(dead) == 1
+        assert dead[0]["url"] == "http://example.com/bad"
+        assert "max_attempts_exceeded" in dead[0]["reason"]
+        hist = frontier.attempt_history("http://example.com/bad")
+        assert [h["outcome"] for h in hist] == ["transient_error"] * 3
+
+        # Dead-letter JSONL file.
+        from nova.crawlers.runner import write_dead_letter
+
+        path = write_dead_letter(dead, tmp_path / "dead_letter.jsonl")
+        lines = path.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 1
+        doc = _json.loads(lines[0])
+        assert doc["url"] == "http://example.com/bad"
+        assert doc["attempts"] == 3
+    finally:
+        frontier.close()
+
+
+# -- article extraction ------------------------------------------------------------
+def test_extract_article_main_content():
+    html = (
+        "<html><head>"
+        '<meta property="og:title" content="Real Article Title">'
+        '<meta name="description" content="A short summary.">'
+        '<meta property="article:published_time" content="2024-05-01T10:00:00Z">'
+        '<meta name="author" content="Jane Doe">'
+        "<title>Site Name</title></head><body>"
+        '<nav><a href="/home">Home</a><a href="/about">About</a></nav>'
+        '<div class="sidebar"><p>Buy our product now! Limited offer!</p></div>'
+        "<article><h1>Real Article Title</h1>"
+        "<p>" + ENGLISH_BODY + "</p>"
+        "<p>" + ENGLISH_BODY + "</p>"
+        "</article>"
+        "<footer>Copyright 2024</footer>"
+        "</body></html>"
+    )
+    article = extract_article(html, "http://example.com/article")
+    assert article["title"] == "Real Article Title"  # og:title wins
+    assert article["description"] == "A short summary."
+    assert article["publish_date"] == "2024-05-01T10:00:00Z"
+    assert article["author"] == "Jane Doe"
+    assert "machine learning" in article["text"]
+    assert "Home" not in article["text"]          # nav excluded
+    assert "Buy our product" not in article["text"]  # sidebar excluded
+    assert article["lang"] == "en"
+    assert 0.0 < article["lang_confidence"] <= 1.0
+    quality = article["quality"]
+    assert quality["word_count"] > 20
+    assert 0.0 <= quality["score"] <= 1.0
+    assert 0.0 <= quality["boilerplate_ratio"] <= 1.0
+
+
+def test_quality_scores_stored(tmp_path):
+    fetcher = FakeFetcher({
+        "http://example.com/": (200, {}, _html("T", ENGLISH_BODY)),
+    })
+    crawler = GeneralCrawler(
+        fetcher=fetcher, politeness_delay_seconds=0,
+        respect_robots_txt=False, max_depth=0, follow_feeds=False)
+    results = crawler.crawl(["http://example.com/"])
+    quality = results[0].flags.get("quality", {})
+    assert quality["word_count"] > 10
+    assert 0.0 <= quality["score"] <= 1.0
+
+    out = crawler.save_results(results, tmp_path / "c.jsonl")
+    doc = _json.loads(out.read_text(encoding="utf-8").splitlines()[0])
+    assert doc["quality"]["score"] == quality["score"]
+
+
+# -- sitemap recursion ---------------------------------------------------------------
+def test_sitemap_recursion_and_lastmod():
+    index_xml = (b"<sitemapindex><sitemap>"
+                 b"<loc>http://example.com/s/nested.xml</loc>"
+                 b"</sitemap></sitemapindex>")
+    nested_xml = (b"<urlset><url>"
+                  b"<loc>http://example.com/p1</loc>"
+                  b"<lastmod>2024-01-02</lastmod>"
+                  b"</url></urlset>")
+    routes = {
+        "http://example.com/sitemap.xml": (
+            200, {"Content-Type": "application/xml"}, index_xml),
+        "http://example.com/s/nested.xml": (
+            200, {"Content-Type": "application/xml"}, nested_xml),
+        "http://example.com/p1": (200, {}, _html("P1", ENGLISH_BODY)),
+    }
+    fetcher = FakeFetcher(routes)
+    crawler = GeneralCrawler(
+        fetcher=fetcher, politeness_delay_seconds=0,
+        respect_robots_txt=False, concurrency=2, max_depth=0,
+        follow_feeds=False)
+    results = crawler.crawl(["http://example.com/sitemap.xml"])
+    urls = {r.url for r in results}
+    assert "http://example.com/s/nested.xml" in fetcher.fetched
+    assert "http://example.com/p1" in urls
+    page = next(r for r in results if r.url == "http://example.com/p1")
+    assert "machine learning" in page.text
+
+
+# -- conditional revalidation (304) -----------------------------------------------------
+def test_conditional_not_modified(tmp_path):
+    seen = SeenStore(tmp_path / "seen.db")
+    try:
+        seen.mark("http://example.com/page", etag='"abc123"')
+        frontier = Frontier(":memory:")
+        try:
+            frontier.add("http://example.com/page", depth=0,
+                         discovered_from="sitemap:test", revalidate=True,
+                         max_attempts=1)
+            fetcher = ConditionalFetcher({
+                "http://example.com/page": (
+                    200, {"ETag": '"abc123"'},
+                    _html("P", ENGLISH_BODY)),
+            })
+            crawler = GeneralCrawler(
+                fetcher=fetcher, seen_store=seen, frontier=frontier,
+                politeness_delay_seconds=0, respect_robots_txt=False,
+                concurrency=1, max_depth=0, follow_feeds=False)
+            results = crawler.crawl([])
+            # 304: recorded as not-modified, nothing re-extracted.
+            assert results == []
+            assert crawler.stats["not_modified"] == 1
+            assert fetcher.conditional_used  # If-None-Match was actually sent
+            hist = frontier.attempt_history("http://example.com/page")
+            assert hist and hist[-1]["outcome"] == "not_modified"
+        finally:
+            frontier.close()
+    finally:
+        seen.close()
+
+
+# -- no duplicate fetch under concurrency ------------------------------------------------
+def test_concurrent_no_duplicate_fetch():
+    routes = {
+        "http://example.com/a": (
+            200, {}, _html("A", ENGLISH_BODY, links=["/shared"])),
+        "http://example.com/b": (
+            200, {}, _html("B", ENGLISH_BODY, links=["/shared"])),
+        "http://example.com/shared": (200, {}, _html("S", ENGLISH_BODY)),
+    }
+    fetcher = FakeFetcher(routes)
+    crawler = GeneralCrawler(
+        fetcher=fetcher, politeness_delay_seconds=0,
+        respect_robots_txt=False, concurrency=4, max_depth=1,
+        follow_feeds=False)
+    crawler.crawl(["http://example.com/a", "http://example.com/b"])
+    assert fetcher.fetched.count("http://example.com/shared") == 1
