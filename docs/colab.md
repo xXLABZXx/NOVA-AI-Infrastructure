@@ -1,8 +1,58 @@
 # Google Colab integration
 
-Training runs where GPUs live. This repo is designed so the **data pipeline runs
-locally (or in Docker)** and **training runs in Colab** against approved,
-versioned datasets.
+## 0. Run the crawler in Colab (no computer needed)
+
+Colab works from a phone browser and has normal internet access, so the
+sandbox's SSRF protection is happy. Steps:
+
+**1. Create a GitHub access token** (the repo is private): on github.com go to
+Settings → Developer settings → Personal access tokens → Fine-grained tokens →
+Generate new token. Give it access to `NOVA-AI-Infrastructure` with
+**Contents: Read-only**. Copy the token (it starts with `github_pat_...`).
+
+**2. New notebook** at colab.research.google.com, then:
+
+```python
+# Clone (paste your token where indicated)
+!git clone https://<PASTE_TOKEN_HERE>@github.com/xXLABZXx/NOVA-AI-Infrastructure.git
+%cd NOVA-AI-Infrastructure
+!pip install -e . -q
+```
+
+**3. Crawl:**
+
+```python
+!python -m nova.crawlers.runner --out data/raw https://en.wikipedia.org/wiki/Artificial_intelligence
+```
+
+The default config already allowlists `en.wikipedia.org`, `arxiv.org`, and
+`docs.python.org`, and caps the crawl at 5,000 pages / 200 per host. Tune
+`configs/config.yaml` (`crawlers:` section) for bigger or smaller runs.
+
+**4. Inspect what you got:**
+
+```python
+!ls -la data/raw
+!head -c 1500 data/raw/crawl.jsonl
+```
+
+**5. Curate it** (raw → cleaned → approved/rejected):
+
+```python
+!./scripts/curate.sh
+!ls data/approved/
+```
+
+**6. Save your data:** Colab VMs are ephemeral — download `data/approved/` (or
+copy it to Google Drive with `drive.mount('/content/drive')`) before closing
+the notebook, or your crawl is gone.
+
+> **Security note:** your token grants repo access. Don't share the notebook
+> with the token in it — revoke the token at
+> Settings → Developer settings → Personal access tokens when you're done, or
+> use a fresh one per session.
+
+---
 
 ## 1. Prepare an approved dataset locally
 
