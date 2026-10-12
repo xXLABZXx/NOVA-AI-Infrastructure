@@ -103,3 +103,55 @@ monitoring:
 security:
   enabled: true
   max_input_chars: 1000000
+
+datasets:
+  enabled: true
+  # Glob for the base parts; supports "archive.zip" or "archive.zip:member-glob"
+  # for the shipped 20-part dataset.
+  base_parts_glob: "NOVA_DATASET_#0007_part-*.txt"
+  version: "8"
+  stages:
+    profile: true
+    diversify: true
+    ingest: true
+    mix: true
+  diversify:
+    min_template_count: 1000   # answers seen >= this often are "collapsed"
+    limit: 0                   # max rewrites per run (0 = no limit)
+    dry_run: true               # true until a teacher API key is configured
+    resume_from: ""             # record id to resume after
+    max_tokens: 600
+    cost_per_mtok_in: 0.27      # DeepSeek chat pricing, USD per 1M tokens
+    cost_per_mtok_out: 1.10
+    teacher:
+      provider: "deepseek"
+      base_url: "https://api.deepseek.com"
+      model: "deepseek-chat"
+      max_calls_per_run: 1000
+      max_tokens_per_call: 600
+      temperature: 0.9          # high: we WANT diverse rewrites
+  commoncrawl:
+    crawl_id: ""                # empty = latest crawl from collinfo.json
+    domains: ["en.wikipedia.org", "arxiv.org", "docs.python.org"]
+    max_records: 100000
+    language: "en"
+    min_chars: 200
+  mixer:
+    base_hash_db: "data/base_hashes.sqlite"
+    output_dir: "data/dataset-v8"
+    records_per_part: 500000
+    seed: 42
+    min_text_chars: 50
+    enable_near_dedup: true
+    near_dup_threshold_bits: 8
+    category_weights:           # target mix ratios (normalized)
+      general_chat: 1.0
+      logic_reasoning: 1.0
+      programming: 1.0
+      reading_comprehension: 1.0
+      reasoning: 1.0
+      science: 1.0
+      tool_use: 1.0
+      web: 0.5
+    split_ratios: {train: 80, val: 10, test: 5, challenge: 5}
+    extra_sources: []           # [{name: "crawler", pattern: "data/raw/crawl.jsonl"}]

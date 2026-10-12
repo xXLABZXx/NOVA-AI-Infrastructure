@@ -2,6 +2,18 @@
 
 All notable changes to NOVA AI Infrastructure are recorded here.
 
+## [Unreleased]
+### Added
+- Sandbox HTTP client now accepts caller-supplied request headers via
+  `fetch(url, headers=...)`. Only safe informational headers are allowed
+  (`User-Agent`, `Accept`, `Accept-Language`, `If-None-Match`,
+  `If-Modified-Since`); anything else -- `Host`, `Cookie`, `Authorization`,
+  CRLF injection attempts -- raises `SandboxError`. This activates the
+  crawler's conditional-request optimization: recrawls now send
+  `If-None-Match` / `If-Modified-Since` from the seen store and skip
+  unchanged pages on `304 Not Modified` (returned as a result, never
+  retried, nothing quarantined).
+
 ## [0.1.0] - 2026-10-12
 ### Added
 - Initial scaffold: `src/nova` package with sandbox, crawlers, ingestion,
