@@ -1,13 +1,15 @@
-# Scheduled + on-demand web crawl.
+# Scheduled + on-demand web crawl, with results delivered to Google Drive.
 #
 # - Runs automatically every Monday at 06:00 UTC.
 # - Or trigger manually from the repo's Actions tab ("Run workflow") with your
 #   own seed URLs and page budget — works from the GitHub mobile app.
-# - Results (crawl.jsonl + dead_letter.jsonl) are uploaded as a downloadable
-#   artifact kept for 30 days. Nothing is committed to the repo.
+# - Results are committed to the `crawl-data` branch (timestamped files).
+#   Muse picks them up from there and delivers them to the "NOVA crawls"
+#   Google Drive folder automatically — no setup needed on your side.
+# - Results are also kept as a workflow artifact for 30 days as a backup.
 #
-# Setup: upload this file to .github/workflows/ in the repo (GitHub web UI:
-# Add file -> Upload files). No secrets or extra configuration needed.
+# Install: upload this file to .github/workflows/ in the repo (GitHub web UI:
+# Add file -> Upload files, or open the existing file -> edit -> paste -> commit).
 
 name: Scheduled crawl
 
@@ -26,7 +28,7 @@ on:
         default: "500"
 
 permissions:
-  contents: read
+  contents: write  # needed to publish results to the crawl-data branch
 
 jobs:
   crawl:
@@ -54,7 +56,7 @@ jobs:
             --out crawl-out \
             ${{ inputs.seeds || 'https://en.wikipedia.org/wiki/Artificial_intelligence https://arxiv.org/ https://docs.python.org/3/' }}
 
-      - name: Upload results
+      - name: Upload results (artifact)
         uses: actions/upload-artifact@v4
         with:
           name: crawl-results
@@ -62,3 +64,24 @@ jobs:
             crawl-out/crawl.jsonl
             crawl-out/dead_letter.jsonl
           retention-days: 30
+
+      - name: Publish results to crawl-data branch
+        run: |
+          set -e
+          TS=$(date -u +%Y%m%dT%H%M%SZ)
+          git config user.name "nova-crawler"
+          git config user.email "nova-crawler@users.noreply.github.com"
+          if git ls-remote --exit-code --heads origin crawl-data >/dev/null 2>&1; then
+            git fetch origin crawl-data:crawl-data
+            git checkout crawl-data
+          else
+            git checkout --orphan crawl-data
+            git rm -rf . >/dev/null 2>&1 || true
+          fi
+          cp "$GITHUB_WORKSPACE/crawl-out/crawl.jsonl" "crawl-${TS}.jsonl"
+          if [ -f "$GITHUB_WORKSPACE/crawl-out/dead_letter.jsonl" ]; then
+            cp "$GITHUB_WORKSPACE/crawl-out/dead_letter.jsonl" "dead_letter-${TS}.jsonl"
+          fi
+          git add "crawl-${TS}.jsonl" "dead_letter-${TS}.jsonl" 2>/dev/null || git add "crawl-${TS}.jsonl"
+          git commit -m "crawl results ${TS}" || echo "nothing to commit"
+          git push origin crawl-data
