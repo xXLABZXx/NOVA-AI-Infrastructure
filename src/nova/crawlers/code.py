@@ -44,10 +44,11 @@ class CodeCrawler(BaseCrawler):
                            list(_CODE_HOSTS) + list(code_hosts or [])}
 
     @classmethod
-    def from_config(cls, section: dict, *, fetcher, seen_store=None) -> "CodeCrawler":
+    def from_config(cls, section: dict, *, fetcher, seen_store=None,
+                    frontier=None) -> "CodeCrawler":
         """Build from a config section; reads ``code_hosts`` when present."""
         crawler = super().from_config(section, fetcher=fetcher,
-                                      seen_store=seen_store)
+                                      seen_store=seen_store, frontier=frontier)
         extra = section.get("code_hosts", []) or []
         crawler.code_hosts |= {h.lower() for h in extra}
         return crawler
