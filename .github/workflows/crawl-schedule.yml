@@ -1,0 +1,64 @@
+# Scheduled + on-demand web crawl.
+#
+# - Runs automatically every Monday at 06:00 UTC.
+# - Or trigger manually from the repo's Actions tab ("Run workflow") with your
+#   own seed URLs and page budget — works from the GitHub mobile app.
+# - Results (crawl.jsonl + dead_letter.jsonl) are uploaded as a downloadable
+#   artifact kept for 30 days. Nothing is committed to the repo.
+#
+# Setup: upload this file to .github/workflows/ in the repo (GitHub web UI:
+# Add file -> Upload files). No secrets or extra configuration needed.
+
+name: Scheduled crawl
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"  # weekly, Monday 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: "Seed URLs (space-separated)"
+        required: true
+        default: "https://en.wikipedia.org/wiki/Artificial_intelligence"
+      max_pages:
+        description: "Max pages to crawl"
+        required: false
+        default: "500"
+
+permissions:
+  contents: read
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Crawl
+        env:
+          NOVA_CRAWLERS_MAX_PAGES_TOTAL: ${{ inputs.max_pages || '2000' }}
+        run: |
+          mkdir -p crawl-out
+          python -m nova.crawlers.runner \
+            --config configs/config.yaml \
+            --out crawl-out \
+            ${{ inputs.seeds || 'https://en.wikipedia.org/wiki/Artificial_intelligence https://arxiv.org/ https://docs.python.org/3/' }}
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: crawl-results
+          path: |
+            crawl-out/crawl.jsonl
+            crawl-out/dead_letter.jsonl
+          retention-days: 30
